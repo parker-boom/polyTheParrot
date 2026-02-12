@@ -22,8 +22,9 @@ npm install
 
 3. Fill in `knowledge/hackathon-info.md`.
 4. Edit prompts/personality in `prompts/config.json`.
+5. Set model + reasoning in `config/openai.json` (defaults are `gpt-5.1` and `low`).
 
-5. Start in dev:
+6. Start in dev:
 
 ```bash
 npm run dev

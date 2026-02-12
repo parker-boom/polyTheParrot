@@ -8,7 +8,6 @@ type RequiredConfig = {
   DISCORD_GUILD_ID: string;
   POLY_CONTROL_CHANNEL_ID: string;
   OWNER_USER_ID: string;
-  OPENAI_MODEL: string;
 };
 
 function requireEnv(name: string): string {
@@ -25,8 +24,7 @@ export const config: RequiredConfig = {
   DISCORD_GUILD_ID: requireEnv("DISCORD_GUILD_ID"),
   POLY_CONTROL_CHANNEL_ID: requireEnv("POLY_CONTROL_CHANNEL_ID"),
   OWNER_USER_ID: requireEnv("OWNER_USER_ID"),
-  OPENAI_MODEL: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
 };
 
 export const TEAM_CHANNEL_REGEX = /^team-(\d{1,2})$/i;
-export const CHECKIN_MARKER_REGEX = /\[POLY_CHECKIN #(\d+)\]/i;
+export const CHECKIN_MARKER_REGEX = /check[\s-]*in\s*#\s*(\d+)/i;

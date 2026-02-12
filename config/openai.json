@@ -1,0 +1,5 @@
+{
+  "model": "gpt-5.1",
+  "reasoningEffort": "low",
+  "maxOutputTokens": 2000
+}

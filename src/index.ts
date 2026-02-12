@@ -13,6 +13,7 @@ import {
 } from "discord.js";
 import OpenAI from "openai";
 import { CHECKIN_MARKER_REGEX, config, TEAM_CHANNEL_REGEX } from "./config.js";
+import { loadModelConfig } from "./modelConfig.js";
 import { loadPromptConfig, renderTemplate } from "./promptConfig.js";
 import { buildTranscript, fetchAllMessages, renderTranscriptForPrompt } from "./transcript.js";
 
@@ -22,17 +23,32 @@ const client = new Client({
 
 const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
-const FUN_FACTS = [
-  "Fun fact: Parrots can mimic over 100 sounds.",
-  "Fun fact: A group of parrots is called a pandemonium.",
-  "Fun fact: Some parrots live for decades.",
-  "Fun fact: Parrots use their feet like hands.",
-  "Fun fact: Many parrots can solve simple puzzles.",
+const CHECKIN_MESSAGES = [
+  "Just checking in here team, how are things going? Can you give me a quick project update and let me know if you have any blockers.",
+  "Quick pulse check, team. How is the project looking right now, and are any blockers slowing you down.",
+  "Checking in on progress. Drop a short update on what you shipped and anything currently blocking momentum.",
+  "How are things feeling right now, team? Share a brief status update and call out blockers if you have them.",
+  "Status check: what is working well, what is in progress, and what blockers should we clear for you.",
+  "Quick team sync from me. Where are you at with the build, and what blockers are getting in the way.",
+  "Give me a fast snapshot of your project status and any blockers that need support.",
+  "How is the project moving along? Send a short update and flag blockers so we can unblock you fast.",
+  "Team check-in time. What did you finish recently, what is next, and what is blocking you right now.",
+  "Dropping in for a quick update. How is the build going, and do you need help with any blockers.",
 ];
 
 let cachedCheckinNumber: number | null = null;
 const HACKATHON_INFO_FILE = path.join(process.cwd(), "knowledge", "hackathon-info.md");
 const HACKATHON_INFO_PLACEHOLDER = "[[REPLACE_WITH_HACKATHON_INFO]]";
+const MAX_TEAM_NUMBER = 3;
+
+function logInfo(event: string, details: Record<string, string | number | boolean | undefined> = {}): void {
+  const suffix = Object.entries(details)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" ");
+  const prefix = `[Poly][${new Date().toISOString()}][${event}]`;
+  console.log(suffix.length > 0 ? `${prefix} ${suffix}` : prefix);
+}
 
 function normalize(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -95,6 +111,7 @@ async function getTeamChannels(guild: Guild): Promise<TextChannel[]> {
   const channels = guild.channels.cache
     .filter((ch): ch is TextChannel => ch.type === ChannelType.GuildText)
     .filter(isTeamTextChannel)
+    .filter((ch) => getTeamNumber(ch.name) <= MAX_TEAM_NUMBER)
     .sort((a, b) => getTeamNumber(a.name) - getTeamNumber(b.name));
 
   return [...channels.values()];
@@ -120,6 +137,10 @@ async function sendToTeamChannel(guild: Guild, channel: TextChannel, body: strin
 }
 
 async function detectLastCheckinNumber(controlChannel: TextChannel, botUserId: string): Promise<number> {
+  logInfo("checkin.counter.scan.start", {
+    channel: controlChannel.name,
+    channelId: controlChannel.id,
+  });
   const history = await fetchAllMessages(controlChannel);
   let max = 0;
 
@@ -131,15 +152,15 @@ async function detectLastCheckinNumber(controlChannel: TextChannel, botUserId: s
     const fromMarker = msg.content.match(CHECKIN_MARKER_REGEX);
     if (fromMarker) {
       max = Math.max(max, Number(fromMarker[1]));
-      continue;
-    }
-
-    const fromSummary = msg.content.match(/Check-in #(\d+)/i);
-    if (fromSummary) {
-      max = Math.max(max, Number(fromSummary[1]));
     }
   }
 
+  logInfo("checkin.counter.scan.done", {
+    channel: controlChannel.name,
+    channelId: controlChannel.id,
+    messages: history.length,
+    latestCheckin: max,
+  });
   return max;
 }
 
@@ -147,7 +168,17 @@ async function registerCommands(guild: Guild): Promise<void> {
   const polyCommand = new SlashCommandBuilder()
     .setName("poly")
     .setDescription("Control Poly the Parrot")
-    .addSubcommand((sub) => sub.setName("checkin").setDescription("Ask all teams for a check-in"))
+    .addSubcommand((sub) =>
+      sub
+        .setName("checkin")
+        .setDescription("Ask all teams for a check-in")
+        .addStringOption((opt) =>
+          opt
+            .setName("ask")
+            .setDescription("Optional extra thing to ask in this check-in")
+            .setRequired(false),
+        ),
+    )
     .addSubcommand((sub) => sub.setName("status").setDescription("Get a status report across all teams"))
     .addSubcommand((sub) =>
       sub
@@ -159,7 +190,7 @@ async function registerCommands(guild: Guild): Promise<void> {
         .addStringOption((opt) => {
           opt.setName("target").setDescription("Send to one team or all teams").setRequired(false);
           opt.addChoices({ name: "all", value: "all" });
-          for (let i = 1; i <= 12; i += 1) {
+          for (let i = 1; i <= MAX_TEAM_NUMBER; i += 1) {
             opt.addChoices({ name: `team-${i}`, value: `team-${i}` });
           }
           return opt;
@@ -184,6 +215,12 @@ function ensureAuthorized(interaction: ChatInputCommandInteraction): string | nu
 async function runCheckin(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply();
   const promptConfig = await loadPromptConfig();
+  const customAsk = interaction.options.getString("ask")?.trim() ?? "";
+  logInfo("command.checkin.start", {
+    byUserId: interaction.user.id,
+    commandChannelId: interaction.channelId,
+    hasCustomAsk: customAsk.length > 0,
+  });
 
   const guild = await getGuildOrThrow();
   const controlChannel = await guild.channels.fetch(config.POLY_CONTROL_CHANNEL_ID);
@@ -203,10 +240,12 @@ async function runCheckin(interaction: ChatInputCommandInteraction): Promise<voi
   cachedCheckinNumber += 1;
   const checkinNumber = cachedCheckinNumber;
 
-  const funFact = FUN_FACTS[(checkinNumber - 1) % FUN_FACTS.length];
+  const checkinMessage = CHECKIN_MESSAGES[(checkinNumber - 1) % CHECKIN_MESSAGES.length];
+  const extraPromptBlock = await buildCheckinAddOn(customAsk, promptConfig.personality);
   const checkinBody = renderTemplate(promptConfig.checkinTemplate, {
     checkin_number: String(checkinNumber),
-    fun_fact: funFact,
+    checkin_message: checkinMessage,
+    extra_prompt_block: extraPromptBlock,
   });
 
   const sent: string[] = [];
@@ -216,8 +255,10 @@ async function runCheckin(interaction: ChatInputCommandInteraction): Promise<voi
     try {
       await sendToTeamChannel(guild, channel, checkinBody);
       sent.push(channel.name);
+      logInfo("command.checkin.sent", { channel: channel.name, channelId: channel.id, checkinNumber });
     } catch {
       failed.push(channel.name);
+      logInfo("command.checkin.failed", { channel: channel.name, channelId: channel.id, checkinNumber });
     }
   }
 
@@ -228,6 +269,11 @@ async function runCheckin(interaction: ChatInputCommandInteraction): Promise<voi
   ].join("\n");
 
   await interaction.editReply(summary);
+  logInfo("command.checkin.done", {
+    checkinNumber,
+    delivered: sent.length,
+    failed: failed.length,
+  });
 }
 
 type HackathonInfoResult = {
@@ -265,14 +311,28 @@ async function buildStatusPrompt(guild: Guild, infoDoc: string, promptTemplate: 
 
   const teamTranscripts = [];
   for (const channel of teamChannels) {
+    logInfo("status.transcript.fetch.start", { channel: channel.name, channelId: channel.id });
     const transcript = await buildTranscript(channel, client.user!.id);
+    logInfo("status.transcript.fetch.done", {
+      channel: channel.name,
+      channelId: channel.id,
+      messages: transcript.messages.length,
+      latestCheckin: transcript.latestCheckinNumber ?? "none",
+    });
     teamTranscripts.push(renderTranscriptForPrompt(transcript));
   }
 
   const controlChannel = await guild.channels.fetch(config.POLY_CONTROL_CHANNEL_ID);
   let controlBlock = "";
   if (controlChannel && controlChannel.type === ChannelType.GuildText) {
+    logInfo("status.transcript.fetch.start", { channel: controlChannel.name, channelId: controlChannel.id });
     const controlTranscript = await buildTranscript(controlChannel, client.user!.id);
+    logInfo("status.transcript.fetch.done", {
+      channel: controlChannel.name,
+      channelId: controlChannel.id,
+      messages: controlTranscript.messages.length,
+      latestCheckin: controlTranscript.latestCheckinNumber ?? "none",
+    });
     controlBlock = renderTranscriptForPrompt(controlTranscript);
   }
 
@@ -284,26 +344,88 @@ async function buildStatusPrompt(guild: Guild, infoDoc: string, promptTemplate: 
 }
 
 async function askOpenAI(prompt: string, instructions?: string): Promise<string> {
+  const modelConfig = await loadModelConfig();
+  logInfo("openai.request", {
+    model: modelConfig.model,
+    reasoningEffort: modelConfig.reasoningEffort,
+    promptChars: prompt.length,
+  });
+
   const response = await openai.responses.create({
-    model: config.OPENAI_MODEL,
+    model: modelConfig.model,
     instructions,
     input: prompt,
+    reasoning: {
+      effort: modelConfig.reasoningEffort,
+    },
+    max_output_tokens: modelConfig.maxOutputTokens,
   });
 
   const text = response.output_text?.trim();
   if (text && text.length > 0) {
+    logInfo("openai.response", {
+      model: modelConfig.model,
+      responseChars: text.length,
+      responseId: response.id,
+    });
     return text;
   }
 
   throw new Error("OpenAI did not return output text.");
 }
 
+async function buildCheckinAddOn(raw: string, personality: string): Promise<string> {
+  const compact = raw.replace(/\s+/g, " ").trim();
+  if (compact.length === 0) {
+    return "";
+  }
+
+  const rewriteInstructions = [
+    personality,
+    "Rewrite organizer instructions into one direct line addressed to the team.",
+    "Voice must be organizer-to-team, not teammate-to-team.",
+    "Use second-person language (you/your team).",
+    "Do not use first-person team voice (we/us/our).",
+    "Output only the final message text.",
+    "Keep it short, natural, conversational, and specific.",
+    "Do not mention the organizer request itself.",
+    "Do not include labels, quotes, or explanations.",
+  ].join("\n");
+
+  const rewritePrompt = [
+    "Convert this add-on request into the exact line Poly should post in team chat.",
+    "Examples:",
+    'Input: "Ask if they are doing a live demo"',
+    'Output: "Are you planning to do a live demo?"',
+    'Input: "Ask how they are feeling about the 3pm deadline"',
+    'Output: "How are you all feeling about the 3pm deadline, and are you on track?"',
+    `Request: ${compact}`,
+  ].join("\n");
+
+  try {
+    const rewritten = await askOpenAI(rewritePrompt, rewriteInstructions);
+    const finalLine = rewritten.trim();
+    if (finalLine.length > 0) {
+      return `\n\n${finalLine}`;
+    }
+  } catch {
+    logInfo("command.checkin.addon.rewrite.fallback", { reason: "openai_error" });
+  }
+
+  return `\n\n${compact}`;
+}
+
 async function runStatus(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply();
+  logInfo("command.status.start", {
+    byUserId: interaction.user.id,
+    commandChannelId: interaction.channelId,
+  });
   const guild = await getGuildOrThrow();
   const info = await loadHackathonInfo();
   if (!info.ready) {
     await interaction.editReply(info.reason ?? "Hackathon info doc is required.");
+    logInfo("command.status.blocked", { reason: info.reason ?? "missing_hackathon_info" });
     return;
   }
 
@@ -320,6 +442,10 @@ async function runStatus(interaction: ChatInputCommandInteraction): Promise<void
   for (let i = 1; i < chunks.length; i += 1) {
     await interaction.followUp(chunks[i]);
   }
+  logInfo("command.status.done", {
+    chunks: chunks.length,
+    reportChars: report.length,
+  });
 }
 
 async function runSend(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -327,6 +453,12 @@ async function runSend(interaction: ChatInputCommandInteraction): Promise<void> 
 
   const message = interaction.options.getString("message", true).trim();
   const target = interaction.options.getString("target") ?? "all";
+  logInfo("command.send.start", {
+    byUserId: interaction.user.id,
+    commandChannelId: interaction.channelId,
+    target,
+    messageChars: message.length,
+  });
 
   const guild = await getGuildOrThrow();
   const teamChannels = await getTeamChannels(guild);
@@ -347,8 +479,10 @@ async function runSend(interaction: ChatInputCommandInteraction): Promise<void> 
     try {
       await sendToTeamChannel(guild, channel, message);
       sent.push(channel.name);
+      logInfo("command.send.sent", { channel: channel.name, channelId: channel.id, target });
     } catch {
       failed.push(channel.name);
+      logInfo("command.send.failed", { channel: channel.name, channelId: channel.id, target });
     }
   }
 
@@ -359,6 +493,11 @@ async function runSend(interaction: ChatInputCommandInteraction): Promise<void> 
   ].join("\n");
 
   await interaction.editReply(summary);
+  logInfo("command.send.done", {
+    target,
+    delivered: sent.length,
+    failed: failed.length,
+  });
 }
 
 function stripBotMention(raw: string, botId: string): string {
@@ -414,27 +553,34 @@ async function runStandby(message: Message): Promise<void> {
   }
 
   const channel = message.channel as TextChannel;
+  logInfo("standby.mention.received", {
+    channel: channel.name,
+    channelId: channel.id,
+    fromUserId: message.author.id,
+    messageId: message.id,
+  });
+
   const transcript = await buildTranscript(channel, client.user.id);
+  logInfo("standby.transcript.loaded", {
+    channel: channel.name,
+    channelId: channel.id,
+    messages: transcript.messages.length,
+    latestCheckin: transcript.latestCheckinNumber ?? "none",
+  });
   const promptConfig = await loadPromptConfig();
   const info = await loadHackathonInfo();
   const userQuestion = stripBotMention(message.content, client.user.id);
   const ownerMention = `<@${config.OWNER_USER_ID}>`;
-
-  if (!info.ready) {
-    await channel.send(`I need organizer context before I can answer reliably. ${ownerMention}`);
-    const controlMissing = await message.guild.channels.fetch(config.POLY_CONTROL_CHANNEL_ID);
-    if (controlMissing && controlMissing.type === ChannelType.GuildText) {
-      await controlMissing.send(`${ownerMention} ${info.reason}`);
-    }
-    return;
-  }
+  const infoDocForStandby = info.ready
+    ? info.text
+    : "No hackathon context doc is currently filled. Use only channel context and general helpful behavior.";
 
   const standbySystemInstructions = renderTemplate(promptConfig.standbySystemInstructions, {
     personality: promptConfig.personality,
   });
   const prompt = renderTemplate(promptConfig.standbyUserTemplate, {
     owner_user_id: config.OWNER_USER_ID,
-    info_doc: info.text,
+    info_doc: infoDocForStandby,
     channel_transcript: renderTranscriptForPrompt(transcript),
     user_question: userQuestion || "[No extra text provided beyond mention]",
   });
@@ -444,6 +590,11 @@ async function runStandby(message: Message): Promise<void> {
 
   if (decision.action === "REPLY") {
     await channel.send(decision.message);
+    logInfo("standby.reply.sent", {
+      channel: channel.name,
+      channelId: channel.id,
+      responseChars: decision.message.length,
+    });
     return;
   }
 
@@ -454,15 +605,16 @@ async function runStandby(message: Message): Promise<void> {
       owner_user_id: config.OWNER_USER_ID,
     }),
   );
+  logInfo("standby.escalated", {
+    channel: channel.name,
+    channelId: channel.id,
+    reason: decision.reason,
+  });
 
   if (control && control.type === ChannelType.GuildText) {
-    const escalation = [
-      `${ownerMention} escalation from ${channel.toString()}`,
-      `Reason: ${decision.reason}`,
-      `Question: ${userQuestion || "[Mention with no question text]"}`,
-      decision.draft ? `Draft reply: ${decision.draft}` : "Draft reply: [none]",
-      `Jump link: ${message.url}`,
-    ].join("\n");
+    const issueSummary =
+      decision.reason.length > 140 ? `${decision.reason.slice(0, 137).trimEnd()}...` : decision.reason;
+    const escalation = `${ownerMention} hey, ${channel.toString()} is having an issue (${issueSummary}). take a look: ${message.url}`;
     await control.send(escalation);
   }
 }
@@ -495,23 +647,37 @@ async function handlePolyCommand(interaction: ChatInputCommandInteraction): Prom
 
 client.once("ready", async () => {
   const tag = client.user?.tag ?? "unknown";
-  console.log(`Poly is online as ${tag}`);
+  logInfo("bot.ready", { user: tag });
 
   try {
     await loadPromptConfig();
+    logInfo("prompt.config.loaded");
   } catch (error) {
     console.error("Prompt config error:", error);
+  }
+
+  try {
+    const modelConfig = await loadModelConfig();
+    logInfo("model.config.loaded", {
+      model: modelConfig.model,
+      reasoningEffort: modelConfig.reasoningEffort,
+      maxOutputTokens: modelConfig.maxOutputTokens,
+    });
+  } catch (error) {
+    console.error("Model config error:", error);
   }
 
   const info = await loadHackathonInfo();
   if (!info.ready) {
     console.warn(info.reason);
+  } else {
+    logInfo("hackathon.info.loaded", { chars: info.text.length });
   }
 
   try {
     const guild = await getGuildOrThrow();
     await registerCommands(guild);
-    console.log("Slash commands synced.");
+    logInfo("commands.synced", { guildId: guild.id });
   } catch (error) {
     console.error("Failed to sync slash commands:", error);
   }
